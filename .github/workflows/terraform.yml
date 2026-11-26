@@ -1,0 +1,75 @@
+# Reusable workflow (SIMPLE MOCK) – no AWS, no cloud provider.
+# Proves the environment switch: terraform init uses that environment's files,
+# and the output prints which environment ran.
+name: terraform
+
+on:
+  workflow_call:
+    inputs:
+      command:     { type: string, required: true }                   # plan | apply
+      environment: { type: string, required: false, default: "" }    # pass directly, or…
+      labels:      { type: string, required: false, default: "[]" }  # …PR labels (JSON); needs exactly one of: sandbox, production
+
+jobs:
+  # 1) Work out the ONE environment for this run
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.pick.outputs.environment }}
+    steps:
+      - id: pick
+        env:
+          ENV_INPUT: ${{ inputs.environment }}
+          LABELS: ${{ inputs.labels }}
+        run: |
+          if [ -n "$ENV_INPUT" ]; then
+            FOUND="$ENV_INPUT"
+          else
+            FOUND=$(echo "$LABELS" | jq -r '[.[] | select(. == "sandbox" or . == "production")] | join(" ")')
+          fi
+          case "$FOUND" in
+            sandbox|production) ;;
+            *) echo "::error::Add exactly one PR label: 'sandbox' or 'production' (found: '${FOUND:-none}')"; exit 1 ;;
+          esac
+          echo "Environment: $FOUND"
+          echo "environment=$FOUND" >> "$GITHUB_OUTPUT"
+
+  # 2) Run Terraform in that environment only
+  terraform:
+    needs: resolve
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve.outputs.environment }}   # GitHub Environment (no variables needed for the mock)
+    env:
+      ENVIRONMENT: ${{ needs.resolve.outputs.environment }}
+      TF_VAR_github_environment: ${{ needs.resolve.outputs.environment }}   # shown in the output
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merged == true && github.event.pull_request.merge_commit_sha || '' }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: terraform init (${{ inputs.command }} → ${{ needs.resolve.outputs.environment }})
+        run: terraform init -input=false -backend-config=envs/$ENVIRONMENT/backend.hcl
+
+      - name: terraform plan
+        if: inputs.command == 'plan'
+        run: terraform plan -input=false -var-file=envs/$ENVIRONMENT/terraform.tfvars
+
+      - name: terraform apply
+        if: inputs.command == 'apply'
+        run: terraform apply -input=false -auto-approve -var-file=envs/$ENVIRONMENT/terraform.tfvars
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### ${{ inputs.command }} → \`$ENVIRONMENT\`"
+            echo "- backend config: \`envs/$ENVIRONMENT/backend.hcl\`"
+            echo "- tfvars: \`envs/$ENVIRONMENT/terraform.tfvars\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ inputs.command }}" = "apply" ]; then
+            { echo '```'; terraform output || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
